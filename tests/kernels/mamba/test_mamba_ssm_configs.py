@@ -5,9 +5,9 @@ Unit tests for the JSON-based config loader added to selective_state_update.
 
 Tests cover:
   - Config filename generation
-  - Loading a bundled config file
-  - VLLM_TUNED_CONFIG_FOLDER env-var override
+  - VLLM_TUNED_CONFIG_FOLDER env-var override (per-GPU subfolder structure)
   - Fallback to heuristic when no config file exists
+  - Nearest-batch interpolation
 """
 
 import json
@@ -17,6 +17,7 @@ from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
     _get_ssm_launch_config,
     get_ssm_config_file_name,
     get_ssm_configs,
+    get_ssm_device_name,
 )
 
 
@@ -26,21 +27,20 @@ from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
 
 def test_config_file_name_format():
     name = get_ssm_config_file_name(128)
-    # Must start with dstate= and contain device_name=
-    assert name.startswith("dstate=128,device_name=")
-    assert name.endswith(".json")
-    # Spaces must be replaced with underscores (GPU names have spaces)
-    assert " " not in name
+    assert name == "dstate=128.json"
 
 
 # ---------------------------------------------------------------------------
-# VLLM_TUNED_CONFIG_FOLDER override
+# VLLM_TUNED_CONFIG_FOLDER override (configs live in <folder>/<device>/dstate=N.json)
 # ---------------------------------------------------------------------------
 
 def test_env_override_loads_custom_config(monkeypatch, tmp_path):
     """VLLM_TUNED_CONFIG_FOLDER should take precedence over the bundled dir."""
-    file_name = get_ssm_config_file_name(16)
-    config_path = os.path.join(tmp_path, file_name)
+    device_name = get_ssm_device_name()
+    gpu_dir = tmp_path / device_name
+    gpu_dir.mkdir()
+
+    config_path = gpu_dir / get_ssm_config_file_name(16)
     payload = {"1": {"BLOCK_SIZE_M": 4, "num_warps": 1}}
     with open(config_path, "w") as f:
         json.dump(payload, f)
@@ -62,11 +62,7 @@ def test_env_override_loads_custom_config(monkeypatch, tmp_path):
 def test_fallback_when_no_config(monkeypatch, tmp_path):
     """_get_ssm_launch_config must fall back to the hard-coded heuristic
     when no JSON file is found for the current device."""
-    get_ssm_configs.cache_clear()
-
-    # Point config folder at an empty directory so no file is found.
     monkeypatch.setenv("VLLM_TUNED_CONFIG_FOLDER", str(tmp_path))
-    # Also shadow the bundled configs dir so it cannot match either.
     monkeypatch.setattr(
         "vllm.model_executor.layers.mamba.ops.mamba_ssm._CONFIGS_DIR",
         str(tmp_path),
@@ -95,11 +91,11 @@ def test_fallback_when_no_config(monkeypatch, tmp_path):
 def test_nearest_batch_interpolation(monkeypatch, tmp_path):
     """When the exact batch size is not in the config, the closest key
     should be selected."""
-    get_ssm_configs.cache_clear()
+    device_name = get_ssm_device_name()
+    gpu_dir = tmp_path / device_name
+    gpu_dir.mkdir()
 
-    file_name = get_ssm_config_file_name(32)
-    config_path = os.path.join(tmp_path, file_name)
-    # Only provide configs for batch 1 and 64.
+    config_path = gpu_dir / get_ssm_config_file_name(32)
     payload = {
         "1":  {"BLOCK_SIZE_M": 8,  "num_warps": 1},
         "64": {"BLOCK_SIZE_M": 32, "num_warps": 4},

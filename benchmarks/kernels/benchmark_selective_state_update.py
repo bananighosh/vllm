@@ -58,8 +58,11 @@ ALL_DSTATES = [16, 32, 64, 128, 256]
 # ---------------------------------------------------------------------------
 
 def get_ssm_config_file_name(dstate: int) -> str:
-    device_name = current_platform.get_device_name().replace(" ", "_")
-    return f"dstate={dstate},device_name={device_name}.json"
+    return f"dstate={dstate}.json"
+
+
+def get_device_name() -> str:
+    return current_platform.get_device_name().replace(" ", "_")
 
 
 def get_ssm_configs_dir() -> str:
@@ -160,6 +163,7 @@ def tune_dstate(
     dtype: torch.dtype,
     num_iters: int,
     verbose: bool,
+    batch_sizes: Optional[list[int]] = None,
 ) -> dict[int, dict]:
     """
     For each batch size, sweep all (BLOCK_SIZE_M, num_warps) combos and
@@ -167,6 +171,7 @@ def tune_dstate(
     """
     # Use a representative shape for tuning (Mamba-2 style, common case).
     nheads, dim, ngroups = 64, 64, 1
+    active_batches = batch_sizes if batch_sizes is not None else BATCH_SIZES
 
     best_per_batch: dict[int, dict] = {}
 
@@ -178,7 +183,7 @@ def tune_dstate(
     print(hdr)
     print("-" * 50)
 
-    for batch in BATCH_SIZES:
+    for batch in active_batches:
         best_time = float("inf")
         best_cfg: dict = {}
 
@@ -218,14 +223,128 @@ def tune_dstate(
 
 
 # ---------------------------------------------------------------------------
+# Correctness validation
+# ---------------------------------------------------------------------------
+
+def _selective_state_update_ref(
+    state: torch.Tensor,
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    dt_bias: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Pure-PyTorch CPU reference for selective_state_update (dt_softplus=True).
+
+    Shapes (all moved to CPU float32 internally):
+        state  : (batch, nheads, dim, dstate)
+        x      : (batch, nheads, dim)
+        dt     : (batch, nheads, dim)
+        A      : (nheads, dim, dstate)
+        B      : (batch, ngroups, dstate)
+        C      : (batch, ngroups, dstate)
+        D      : (nheads, dim)
+        dt_bias: (nheads, dim)
+    Returns:
+        out    : (batch, nheads, dim)  in the original dtype
+    """
+    orig_dtype = x.dtype
+    state = state.clone().cpu().float()
+    x     = x.cpu().float()
+    dt    = dt.cpu().float()
+    A     = A.cpu().float()
+    B     = B.cpu().float()
+    C     = C.cpu().float()
+    D     = D.cpu().float()
+    dt    = dt + dt_bias.cpu().float()
+    dt    = torch.nn.functional.softplus(dt)          # (batch, nheads, dim)
+
+    nheads, _, _ = A.shape
+    ngroups       = B.shape[1]
+
+    dA = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0))  # (batch, nheads, dim, dstate)
+    B_exp = B.repeat_interleave(nheads // ngroups, dim=1)  # (batch, nheads, dstate)
+    C_exp = C.repeat_interleave(nheads // ngroups, dim=1)
+    dB    = dt.unsqueeze(-1) * B_exp.unsqueeze(2)      # (batch, nheads, dim, dstate)
+
+    state_new = state * dA + dB * x.unsqueeze(-1)
+    out = (state_new * C_exp.unsqueeze(2)).sum(-1)     # (batch, nheads, dim)
+    out = out + x * D.unsqueeze(0)
+    return out.to(orig_dtype)
+
+
+def validate_configs(
+    dstate: int,
+    tuned: dict[int, dict],
+    dtype: torch.dtype,
+    atol: float = 1e-2,
+    rtol: float = 1e-2,
+) -> dict[int, bool]:
+    """
+    For every batch size in *tuned*, run the kernel with the tuned config and
+    compare against the CPU reference.  Returns {batch: passed}.
+    """
+    nheads, dim, ngroups = 64, 64, 1
+
+    print(f"\n{'='*74}")
+    print(f"Validation  dstate={dstate}  dtype={dtype}  atol={atol}")
+    print(f"{'='*74}")
+    print(f"{'Batch':>7} | {'MaxAbsErr':>12} | {'Status':>8}")
+    print("-" * 36)
+
+    results: dict[int, bool] = {}
+
+    for batch, cfg in sorted(tuned.items()):
+        state, x, dt, A, B, C, D, dt_bias, out = _make_inputs(
+            batch, nheads, dim, dstate, ngroups, dtype
+        )
+        # Clone state before GPU kernel modifies it in-place
+        state_ref = state.clone()
+
+        # GPU kernel output
+        def _fixed(dstate_, batch_, is_blackwell_):
+            return cfg["BLOCK_SIZE_M"], cfg["num_warps"]
+
+        with patch.object(mamba_ssm_module, "_get_ssm_launch_config", _fixed):
+            selective_state_update(
+                state, x, dt, A, B, C, D=D, z=None,
+                dt_bias=dt_bias, dt_softplus=True, out=out,
+            )
+        torch.cuda.synchronize()
+        gpu_out = out.detach().cpu()
+
+        # CPU reference uses the original (unmodified) state
+        ref_out = _selective_state_update_ref(
+            state_ref, x, dt, A, B, C, D, dt_bias
+        )
+
+        passed = torch.allclose(gpu_out.float(), ref_out.float(),
+                                atol=atol, rtol=rtol)
+        max_err = (gpu_out.float() - ref_out.float()).abs().max().item()
+        status  = "PASS" if passed else "FAIL"
+        results[batch] = passed
+        print(f"{batch:>7} | {max_err:>12.6f} | {status:>8}")
+
+    n_pass = sum(results.values())
+    n_total = len(results)
+    print(f"\n  {n_pass}/{n_total} configs passed validation for dstate={dstate}")
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Save configs
 # ---------------------------------------------------------------------------
 
-def save_configs(dstate: int, configs: dict[int, dict]) -> str:
-    configs_dir = get_ssm_configs_dir()
+def save_configs(dstate: int, configs: dict[int, dict],
+                 save_dir: Optional[str] = None) -> str:
+    base_dir = save_dir if save_dir else get_ssm_configs_dir()
+    # Place configs in a per-GPU subfolder for easy multi-GPU organisation.
+    configs_dir = os.path.join(base_dir, get_device_name())
     os.makedirs(configs_dir, exist_ok=True)
-    file_name = get_ssm_config_file_name(dstate)
-    file_path = os.path.join(configs_dir, file_name)
+    file_path = os.path.join(configs_dir, get_ssm_config_file_name(dstate))
     payload = {str(k): v for k, v in sorted(configs.items())}
     with open(file_path, "w") as f:
         json.dump(payload, f, indent=4)
@@ -352,6 +471,27 @@ def main():
         help="Path to save the benchmark results text file "
              "(default: ssm_benchmark_results_<device>.txt alongside this script)",
     )
+    parser.add_argument(
+        "--save-dir", type=str, default=None,
+        help="Base directory to save JSON configs. Configs are placed in a "
+             "per-GPU subfolder: <save-dir>/<device_name>/. "
+             "(default: vllm/model_executor/layers/mamba/configs/)",
+    )
+    parser.add_argument(
+        "--batches", type=int, nargs="+", default=None,
+        metavar="B",
+        help="Only tune these specific batch sizes, e.g. --batches 2 16 256. "
+             "Useful for stability re-checks on flagged configs.",
+    )
+    parser.add_argument(
+        "--validate", action="store_true",
+        help="After tuning, verify each best config against a CPU reference "
+             "implementation. Configs that fail are flagged in the output.",
+    )
+    parser.add_argument(
+        "--atol", type=float, default=1e-2,
+        help="Absolute tolerance for --validate (default: 1e-2)",
+    )
     args = parser.parse_args()
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
@@ -381,15 +521,27 @@ def main():
         dstates = ALL_DSTATES if args.all_dstates else [args.dstate]
 
         for dstate in dstates:
-            tuned = tune_dstate(dstate, dtype, args.num_iters, args.verbose)
+            tuned = tune_dstate(dstate, dtype, args.num_iters, args.verbose,
+                                args.batches)
 
             if args.compare:
                 compare_heuristic_vs_tuned(
                     dstate, tuned, dtype, args.num_iters, is_blackwell
                 )
 
+            if args.validate:
+                validity = validate_configs(dstate, tuned, dtype, args.atol)
+                # Filter out any configs that failed correctness check
+                failed = [b for b, ok in validity.items() if not ok]
+                if failed:
+                    print(f"\n  WARNING: {len(failed)} config(s) failed "
+                          f"validation for dstate={dstate}: batches {failed}")
+                    print("  These will NOT be saved even with --save-configs.")
+                    tuned = {b: cfg for b, cfg in tuned.items()
+                             if validity.get(b, True)}
+
             if args.save_configs:
-                path = save_configs(dstate, tuned)
+                path = save_configs(dstate, tuned, args.save_dir)
                 print(f"\nSaved: {path}")
             else:
                 print(f"\nBest configs for dstate={dstate}:")

@@ -33,9 +33,16 @@ _CONFIGS_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)),
 
 
 def get_ssm_config_file_name(dstate: int) -> str:
-    """Return the JSON filename for the given dstate and current device."""
-    device_name = current_platform.get_device_name().replace(" ", "_")
-    return f"dstate={dstate},device_name={device_name}.json"
+    """Return the JSON filename for the given dstate.
+
+    Config files are organised per GPU:
+        configs/<device_name>/dstate=<N>.json
+    """
+    return f"dstate={dstate}.json"
+
+
+def get_ssm_device_name() -> str:
+    return current_platform.get_device_name().replace(" ", "_")
 
 
 @functools.lru_cache
@@ -44,10 +51,13 @@ def get_ssm_configs(dstate: int) -> Optional[dict[int, Any]]:
     Return tuned (BLOCK_SIZE_M, num_warps) configs for *selective_state_update*
     keyed by batch size, or ``None`` if no config file is found.
 
-    Config files live in ``vllm/model_executor/layers/mamba/configs/`` and are
-    named ``dstate=<N>,device_name=<GPU>.json``.  They can be generated with
-    ``benchmarks/kernels/benchmark_ssm.py --save-configs``.
+    Config files live in a per-GPU subfolder:
+        vllm/model_executor/layers/mamba/configs/<device_name>/dstate=<N>.json
+
+    They can be generated with:
+        benchmarks/kernels/benchmark_selective_state_update.py --save-configs
     """
+    device_name = get_ssm_device_name()
     json_file_name = get_ssm_config_file_name(dstate)
 
     config_file_paths: list[str] = []
@@ -55,10 +65,12 @@ def get_ssm_configs(dstate: int) -> Optional[dict[int, Any]]:
     # User-supplied override (same env-var as fused_moe)
     user_dir = os.environ.get("VLLM_TUNED_CONFIG_FOLDER")
     if user_dir is not None:
-        config_file_paths.append(os.path.join(user_dir, json_file_name))
+        config_file_paths.append(
+            os.path.join(user_dir, device_name, json_file_name))
 
     # Bundled default
-    config_file_paths.append(os.path.join(_CONFIGS_DIR, json_file_name))
+    config_file_paths.append(
+        os.path.join(_CONFIGS_DIR, device_name, json_file_name))
 
     for path in config_file_paths:
         if os.path.exists(path):
