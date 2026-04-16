@@ -4,15 +4,109 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/selective_state_update.py
 
+import functools
+import json
+import os
+from typing import Any, Optional
+
 import torch
 from packaging import version
 
 from vllm import _custom_ops as ops
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
+from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
+logger = init_logger(__name__)
+
 TRITON3 = HAS_TRITON and (version.parse(triton.__version__) >= version.parse("3.0.0"))
+
+
+# ---------------------------------------------------------------------------
+# JSON config loading (mirrors fused_moe pattern)
+# ---------------------------------------------------------------------------
+
+_CONFIGS_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                            "..", "configs")
+
+
+def get_ssm_config_file_name(dstate: int) -> str:
+    """Return the JSON filename for the given dstate and current device."""
+    device_name = current_platform.get_device_name().replace(" ", "_")
+    return f"dstate={dstate},device_name={device_name}.json"
+
+
+@functools.lru_cache
+def get_ssm_configs(dstate: int) -> Optional[dict[int, Any]]:
+    """
+    Return tuned (BLOCK_SIZE_M, num_warps) configs for *selective_state_update*
+    keyed by batch size, or ``None`` if no config file is found.
+
+    Config files live in ``vllm/model_executor/layers/mamba/configs/`` and are
+    named ``dstate=<N>,device_name=<GPU>.json``.  They can be generated with
+    ``benchmarks/kernels/benchmark_ssm.py --save-configs``.
+    """
+    json_file_name = get_ssm_config_file_name(dstate)
+
+    config_file_paths: list[str] = []
+
+    # User-supplied override (same env-var as fused_moe)
+    user_dir = os.environ.get("VLLM_TUNED_CONFIG_FOLDER")
+    if user_dir is not None:
+        config_file_paths.append(os.path.join(user_dir, json_file_name))
+
+    # Bundled default
+    config_file_paths.append(os.path.join(_CONFIGS_DIR, json_file_name))
+
+    for path in config_file_paths:
+        if os.path.exists(path):
+            with open(path) as f:
+                logger.info_once(
+                    "Using SSM config from %s for selective_state_update.",
+                    path,
+                    scope="global",
+                )
+                raw = json.load(f)
+                return {int(k): v for k, v in raw.items()}
+
+    return None
+
+
+def _get_ssm_launch_config(
+    dstate: int,
+    batch: int,
+    is_blackwell: bool,
+) -> tuple[int, int]:
+    """
+    Return (BLOCK_SIZE_M, num_warps) for a given dstate and batch size.
+
+    Tries the JSON config first; falls back to the original hard-coded
+    heuristic so existing behaviour is fully preserved when no config file
+    is present.
+    """
+    configs = get_ssm_configs(dstate)
+    if configs is not None:
+        # Pick the closest batch size in the tuned grid (same strategy as MoE)
+        closest = min(configs.keys(), key=lambda x: abs(x - batch))
+        cfg = configs[closest]
+        return cfg["BLOCK_SIZE_M"], cfg["num_warps"]
+
+    # ---- original hard-coded heuristic (unchanged) ----
+    BLOCK_SIZE_M, num_warps = 4, 8
+    if dstate <= 16:
+        BLOCK_SIZE_M, num_warps = 32, 4
+    elif dstate <= 32:
+        BLOCK_SIZE_M, num_warps = 16, 4
+    elif dstate <= 64:
+        BLOCK_SIZE_M, num_warps = 8, 4
+    else:
+        if is_blackwell:
+            BLOCK_SIZE_M, num_warps = 32, 8
+        elif dstate <= 128:
+            BLOCK_SIZE_M, num_warps = 4, 4
+    return BLOCK_SIZE_M, num_warps
 
 if TRITON3:
 
@@ -442,24 +536,8 @@ def selective_state_update(
         else (0, 0)
     )
     # We don't want autotune since it will overwrite the state.
-    # We instead tune by hand based on dstate.
-
-    # Default
-    BLOCK_SIZE_M, num_warps = 4, 8
-
-    if dstate <= 16:
-        BLOCK_SIZE_M, num_warps = 32, 4
-    elif dstate <= 32:
-        BLOCK_SIZE_M, num_warps = 16, 4
-    elif dstate <= 64:
-        BLOCK_SIZE_M, num_warps = 8, 4
-    else:
-        # dstate > 64
-        if is_blackwell:
-            # Optimized for B200 with dstate>64
-            BLOCK_SIZE_M, num_warps = 32, 8
-        elif dstate <= 128:
-            BLOCK_SIZE_M, num_warps = 4, 4
+    # Load from JSON config if available, otherwise fall back to heuristic.
+    BLOCK_SIZE_M, num_warps = _get_ssm_launch_config(dstate, N, is_blackwell)
 
     tie_hdim = (
         A.stride(-1) == 0
