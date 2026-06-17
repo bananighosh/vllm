@@ -230,6 +230,25 @@ class Scheduler(SchedulerInterface):
                 # for the last sampled token plus queries for each draft token.
                 self.num_lookahead_tokens = self.num_spec_tokens + 1
 
+        # Cascade adaptive-k tracker (per-request, MoE-aware).
+        self.cascade_tracker = None
+        if (
+            speculative_config is not None
+            and speculative_config.enable_cascade
+            and self.num_spec_tokens > 1
+        ):
+            from vllm.v1.spec_decode.cascade import CascadeTracker
+
+            self.cascade_tracker = CascadeTracker(
+                k_max=self.num_spec_tokens,
+                t_test=speculative_config.cascade_steps_per_k,
+                cost_factor=speculative_config.cascade_cost_factor,
+                re_test_interval=speculative_config.cascade_re_test_interval,
+            )
+
+        # Extra lookahead slots beyond k (1 for DFlash, 0 for all others).
+        self._lookahead_extra = self.num_lookahead_tokens - self.num_spec_tokens
+
         # Create the KV cache manager.
         if hash_block_size is None:
             hash_block_size = block_size
@@ -482,7 +501,9 @@ class Scheduler(SchedulerInterface):
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_lookahead_tokens=self._cascade_lookahead(
+                            request.request_id
+                        ),
                     )
 
                     if new_blocks is not None:
@@ -800,7 +821,9 @@ class Scheduler(SchedulerInterface):
                 # of local and remote blocks.
                 limit_lookahead_tokens = load_kv_async and self.use_eagle
                 effective_lookahead_tokens = (
-                    0 if limit_lookahead_tokens else self.num_lookahead_tokens
+                    0
+                    if limit_lookahead_tokens
+                    else self._cascade_lookahead(request.request_id)
                 )
 
                 # Determine if we need to allocate cross-attention blocks.
@@ -1036,6 +1059,19 @@ class Scheduler(SchedulerInterface):
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
+
+    def _cascade_lookahead(self, req_id: str) -> int:
+        """Return the number of KV lookahead slots to pre-allocate for req_id.
+
+        When Cascade is active, this equals the per-request adaptive k (plus any
+        method-specific extra, e.g. +1 for DFlash).  Falls back to the global
+        num_lookahead_tokens when Cascade is disabled or the proposer does not
+        use KV cache for draft generation (num_lookahead_tokens == 0, e.g. ngram).
+        """
+        if self.cascade_tracker is None or self.num_lookahead_tokens == 0:
+            return self.num_lookahead_tokens
+        k = self.cascade_tracker.get_k(req_id)
+        return k + self._lookahead_extra if k > 0 else 0
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.
@@ -1498,6 +1534,12 @@ class Scheduler(SchedulerInterface):
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
+                if self.cascade_tracker is not None:
+                    self.cascade_tracker.update(
+                        req_id,
+                        k_used=num_draft_tokens,
+                        accepted=num_accepted,
+                    )
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:
@@ -1838,6 +1880,11 @@ class Scheduler(SchedulerInterface):
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
+            # Cascade: truncate to the per-request adaptive k before caching.
+            if self.cascade_tracker is not None:
+                k = self.cascade_tracker.get_k(req_id)
+                if k < len(spec_token_ids):
+                    spec_token_ids = spec_token_ids[:k]
             request.spec_token_ids = spec_token_ids
 
     def update_draft_token_ids_in_output(
@@ -1901,6 +1948,8 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            if self.cascade_tracker is not None:
+                self.cascade_tracker.add_request(request.request_id)
             if self.connector is not None:
                 self.connector.on_new_request(request)
             if self.log_stats:
@@ -1978,6 +2027,8 @@ class Scheduler(SchedulerInterface):
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
+        if self.cascade_tracker is not None:
+            self.cascade_tracker.remove_request(request_id)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)

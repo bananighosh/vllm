@@ -136,6 +136,28 @@ class SpeculativeConfig:
     O(2 * tp_size) per token. Only applies to greedy draft selection in
     non-tree speculation."""
 
+    # Cascade adaptive-k configuration
+    enable_cascade: bool = False
+    """Enable Cascade utility-driven adaptive-k speculative decoding
+    (https://arxiv.org/abs/2506.20675).  When enabled, each request
+    independently selects the number of speculative tokens that maximises
+    throughput according to a simple cost model.  Particularly beneficial
+    for MoE models where verification cost scales with k."""
+    cascade_steps_per_k: int = Field(default=20, gt=0)
+    """Number of scheduler steps spent testing each candidate k value
+    during the Cascade testing phase.  Larger values yield more accurate
+    utility estimates at the cost of a longer warm-up period."""
+    cascade_cost_factor: float = Field(default=0.5, ge=0.0, le=1.0)
+    """Per-draft-token verification overhead as a fraction of the base
+    target-model forward-pass cost.  Set close to 0 for dense models
+    (batched verification is almost free) and closer to 1 for pure-MoE
+    models where each additional draft token triggers separate expert
+    activations."""
+    cascade_re_test_interval: int = Field(default=0, ge=0)
+    """If > 0, re-enter the testing phase every this many production steps
+    so the system can adapt to changing context characteristics.
+    0 (default) means test once and never re-test."""
+
     # Ngram proposer configuration
     prompt_lookup_max: int | None = Field(default=None, ge=1)
     """Maximum size of ngram token window when using Ngram proposer, required
